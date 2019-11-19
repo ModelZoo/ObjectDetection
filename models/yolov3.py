@@ -1,11 +1,6 @@
 import numpy as np
-
 from model_zoo import Model
 import tensorflow as tf
-
-STRIDES = [
-    8, 16, 32
-]
 
 
 class YOLOV3Model(Model):
@@ -19,7 +14,11 @@ class YOLOV3Model(Model):
         :param config:
         """
         self.number_anchors = config.get('number_anchors')
+        
         self.number_classes = config.get('number_classes')
+        self.anchors = [[[1.25, 1.625], [2.0, 3.75], [4.125, 2.875]],
+                        [[1.875, 3.8125], [3.875, 2.8125], [3.6875, 7.4375]],
+                        [[3.625, 2.8125], [4.875, 6.1875], [11.65625, 10.1875]]]
         super(YOLOV3Model, self).__init__(config)
     
     def conv_block(self, inputs, filters, kernel_size, strides=(1, 1)):
@@ -116,8 +115,8 @@ class YOLOV3Model(Model):
         
         # output1
         x = self.conv_set_block(x, filters=512)
-        y1 = self.output_block(x, filters=512, output_dim=output_dim)
-        y1_pred = self.predict_block(y1, strides=32)
+        y1_conv = self.output_block(x, filters=512, output_dim=output_dim)
+        y1_pred = self.predict_block(y1_conv, stride=32, layer=0)
         
         x = self.conv_block(x, filters=256, kernel_size=(1, 1))
         x = tf.keras.layers.UpSampling2D(size=2)(x)
@@ -125,8 +124,8 @@ class YOLOV3Model(Model):
         
         # output2
         x = self.conv_set_block(x, filters=256)
-        y2 = self.output_block(x, filters=256, output_dim=output_dim)
-        y2_pred = self.predict_block(y2, strides=16)
+        y2_conv = self.output_block(x, filters=256, output_dim=output_dim)
+        y2_pred = self.predict_block(y2_conv, stride=16, layer=1)
         
         x = self.conv_block(x, filters=128, kernel_size=(1, 1))
         x = tf.keras.layers.UpSampling2D(size=2)(x)
@@ -134,9 +133,10 @@ class YOLOV3Model(Model):
         
         # output3
         x = self.conv_set_block(x, filters=128)
-        y3 = self.output_block(x, filters=128, output_dim=output_dim)
-        y3_pred = self.predict_block(y3, strides=8)
-        return y1_pred, y2_pred, y3_pred
+        y3_conv = self.output_block(x, filters=128, output_dim=output_dim)
+        y3_pred = self.predict_block(y3_conv, stride=8, layer=2)
+        
+        return y1_conv, y1_pred, y2_conv, y2_pred, y3_conv, y3_pred
     
     def hook(self):
         """
@@ -145,22 +145,47 @@ class YOLOV3Model(Model):
         """
         pass
     
-    def predict_block(self, inputs, strides):
+    def predict_block(self, inputs, stride, layer):
+        """
+        Convert conv result to predict result.
+        :param inputs:
+        :param stride:
+        :param layer: 0-2 layer
+        :return:
+        """
+        conv_shape = tf.shape(inputs)
+        batch_size = conv_shape[0]
+        output_size = conv_shape[1]
         
-        shape = tf.shape(inputs)
-        x = tf.reshape(inputs, [shape[0], shape[1], shape[2], 3, 5 + self.number_classes])
+        # output_size = 52
         
-        bx_by, bw_bh, b_cont_prob, b_class_prob = x[:, :, :, :, 0:2], x[:, :, :, :, 2:4], x[:, :, :, :, 4:5], x[:, :, :,
-                                                                                                              :, 5:]
+        conv_output = tf.reshape(inputs, (-1, output_size, output_size, 3, 5 + self.number_classes))
         
-        print('bx', bx_by, bw_bh, b_cont_prob, b_class_prob)
+        conv_raw_dxdy = conv_output[:, :, :, :, 0:2]  # center
+        conv_raw_dwdh = conv_output[:, :, :, :, 2:4]  # width, height
+        conv_raw_conf = conv_output[:, :, :, :, 4:5]
+        conv_raw_prob = conv_output[:, :, :, :, 5:]
         
-        pred_xy = tf.sigmoid(bx_by) * strides
-        pred_wh = tf.sigmoid(bw_bh) * strides
-        pred_cont_prob = tf.sigmoid(b_cont_prob)
-        pred_class_prob = tf.sigmoid(b_class_prob)
+        # build grid
+        y = tf.tile(tf.range(output_size, dtype=tf.int32)[:, tf.newaxis], [1, output_size])
+        x = tf.tile(tf.range(output_size, dtype=tf.int32)[tf.newaxis, :], [output_size, 1])
+        xy_grid = tf.concat([x[:, :, tf.newaxis], y[:, :, tf.newaxis]], axis=-1)
+        xy_grid = tf.tile(xy_grid[tf.newaxis, :, :, tf.newaxis, :], [batch_size, 1, 1, 3, 1])
+        xy_grid = tf.cast(xy_grid, tf.float32)
         
-        pred_box = tf.concat([pred_xy, pred_wh, pred_cont_prob, pred_class_prob], axis=-1)
+        # center of predict
+        pred_xy = (tf.sigmoid(conv_raw_dxdy) + xy_grid) * stride
+        # width, height of predict
+        pred_wh = (tf.exp(conv_raw_dwdh) * self.anchors[layer]) * stride
+        # concat above results of predict
+        pred_xywh = tf.concat([pred_xy, pred_wh], axis=-1)
+        
+        # confidence of predict
+        pred_conf = tf.sigmoid(conv_raw_conf)
+        # probs of each class
+        pred_prob = tf.sigmoid(conv_raw_prob)
+        # concat them and return
+        return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
     
     def loss(self):
         """
@@ -217,69 +242,78 @@ class YOLOV3Model(Model):
             
             return giou
         
-        def compute_loss(y_true, y_conv):
-            for index, (y_true_item, y_conv_item) in enumerate(zip(y_true, y_conv)):
-                shape = tf.shape(y_conv_item)
-                x = tf.reshape(y_conv_item, [shape[0], shape[1], shape[2], 3, 5 + self.number_classes])
+        def layer_loss(y_conv, y_pred, y_true, layer):
+            """
+            Compute
+            :param y_conv:
+            :param y_pred:
+            :param y_true:
+            :param i:
+            :return:
+            """
+            bboxes = []
+            conv_shape = tf.shape(y_conv)
+            batch_size = conv_shape[0]
+            output_size = conv_shape[1]
+            input_size = STRIDES[layer] * output_size
+            y_conv = tf.reshape(y_conv, (batch_size, output_size, output_size, 3, 5 + self.number_classes))
+            
+            conv_raw_conf = y_conv[:, :, :, :, 4:5]
+            conv_raw_prob = y_conv[:, :, :, :, 5:]
+            
+            pred_xywh = y_pred[:, :, :, :, 0:4]
+            pred_conf = y_pred[:, :, :, :, 4:5]
+            
+            label_xywh = y_true[:, :, :, :, 0:4]
+            respond_bbox = y_true[:, :, :, :, 4:5]
+            label_prob = y_true[:, :, :, :, 5:]
+            
+            giou = tf.expand_dims(bbox_giou(pred_xywh, label_xywh), axis=-1)
+            input_size = tf.cast(input_size, tf.float32)
+            bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_size ** 2)
+            
+            # compute giou loss
+            giou_loss = respond_bbox * bbox_loss_scale * (1 - giou)
+            
+            iou = bbox_iou(pred_xywh[:, :, :, :, np.newaxis, :], bboxes[:, np.newaxis, np.newaxis, np.newaxis, :, :])
+            max_iou = tf.expand_dims(tf.reduce_max(iou, axis=-1), axis=-1)
+            
+            respond_bgd = (1.0 - respond_bbox) * tf.cast(max_iou < 0.45, tf.float32)
+            
+            conf_focal = tf.pow(respond_bbox - pred_conf, 2)
+            
+            conf_loss = conf_focal * (
+                respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
+                +
+                respond_bgd * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
+            )
+            
+            prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob, logits=conv_raw_prob)
+            
+            giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1, 2, 3, 4]))
+            conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1, 2, 3, 4]))
+            prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1, 2, 3, 4]))
+            
+            return giou_loss, conf_loss, prob_loss
+        
+        def total_loss(y_true, y_output):
+            """
+            Compute total loss
+            :param y_true:
+            :param y_output:
+            :return:
+            """
+            total_loss = 0
+            
+            for i in range(3):
+                y_conv, y_pred = y_output[i * 2], y_output[i * 2 + 1]
                 
-                bx_by, bw_bh, b_cont_prob, b_class_prob = x[:, :, :, :, 0:2], x[:, :, :, :, 2:4], x[:, :, :, :, 4:5], x[
-                                                                                                                      :,
-                                                                                                                      :,
-                                                                                                                      :,
-                                                                                                                      :,
-                                                                                                                      5:]
-                print('bx', bx_by, bw_bh, b_cont_prob, b_class_prob)
+                giou_loss, conf_loss, prob_loss = layer_loss(y_conv, y_pred, y_true, i)
                 
-                pred_xy = tf.sigmoid(bx_by) * STRIDES[index]
-                pred_wh = tf.sigmoid(bw_bh) * STRIDES[index]
-                pred_cont_prob = tf.sigmoid(b_cont_prob)
-                pred_class_prob = tf.sigmoid(b_class_prob)
-                
-                y_pred_item = tf.concat([pred_xy, pred_wh, pred_cont_prob, pred_class_prob], axis=-1)
-                
-                conv_shape = tf.shape(conv)
-                batch_size = conv_shape[0]
-                output_size = conv_shape[1]
-                input_size = STRIDES[index] * output_size
-                conv = tf.reshape(conv, (batch_size, output_size, output_size, 3, 5 + NUM_CLASS))
-                
-                conv_raw_conf = y_conv_item[:, :, :, :, 4:5]
-                conv_raw_prob = y_conv_item[:, :, :, :, 5:]
-                
-                pred_xywh = y_pred_item[:, :, :, :, 0:4]
-                pred_conf = y_pred_item[:, :, :, :, 4:5]
-                
-                label_xywh = y_true_item[:, :, :, :, 0:4]
-                respond_bbox = y_true_item[:, :, :, :, 4:5]
-                label_prob = y_true_item[:, :, :, :, 5:]
-                
-                giou = tf.expand_dims(bbox_giou(pred_xywh, label_xywh), axis=-1)
-                input_size = tf.cast(input_size, tf.float32)
-                
-                bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (
-                    input_size ** 2)
-                giou_loss = respond_bbox * bbox_loss_scale * (1 - giou)
-                
-                iou = bbox_iou(pred_xywh[:, :, :, :, np.newaxis, :],
-                               bboxes[:, np.newaxis, np.newaxis, np.newaxis, :, :])
-                max_iou = tf.expand_dims(tf.reduce_max(iou, axis=-1), axis=-1)
-                
-                respond_bgd = (1.0 - respond_bbox) * tf.cast(max_iou < IOU_LOSS_THRESH, tf.float32)
-                
-                conf_focal = tf.pow(respond_bbox - pred_conf, 2)
-                
-                conf_loss = conf_focal * (
-                    respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
-                    +
-                    respond_bgd * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
-                )
-                
-                prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob,
-                                                                                   logits=conv_raw_prob)
-                
-                giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1, 2, 3, 4]))
-                conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1, 2, 3, 4]))
-                prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1, 2, 3, 4]))
-    
-    # def loss(self):
-    #     def _loss(y_true, y_pred):
+                total_loss += giou_loss
+                total_loss += conf_loss
+                total_loss += prob_loss
+            
+            return total_loss
+        
+        return total_loss
